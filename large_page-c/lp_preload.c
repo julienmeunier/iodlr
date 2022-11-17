@@ -37,6 +37,7 @@ static int tryMapAllDSOs(struct dl_phdr_info* hdr, size_t size, void* data) {
 }
 
 
+#if 0
 void __attribute__((constructor)) map_to_large_pages() {
   bool is_enabled = true;
   fprintf(stderr, "TID: %d\n:", gettid());
@@ -75,3 +76,4 @@ fail:
             MapStatusStr(status, true));
   }
 }
+#endif

@@ -63,6 +63,7 @@ typedef enum {
 
 map_status MapStaticCodeToLargePages();
 map_status MapDSOToLargePages(const char* lib_regex);
+map_status MapAllDSOToFixedPages(const char* lib_regex, const char* device);
 map_status MapStaticCodeRangeToLargePages(void* from, void* to);
 map_status IsLargePagesEnabled(bool* result);
 const char* MapStatusStr(map_status status, bool fulltext);

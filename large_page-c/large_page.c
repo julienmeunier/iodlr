@@ -32,6 +32,12 @@
 #include <inttypes.h>
 #include <linux/limits.h>
 #include <regex.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <syslog.h>
+
 
 #ifndef MAP_HUGETLB
 #define MAP_HUGETLB 0x40000 /* arch specific */
@@ -53,9 +59,28 @@ typedef struct {
   map_status status;
 } FindParams;
 
+typedef struct {
+  uintptr_t *start;
+  uintptr_t *end;
+  char      **name;
+  regex_t regex;
+  bool have_regex;
+  map_status status;
+  int nb_segs;
+} FindParamsAll;
+
 int iodlr_number_of_ehp_avail = 0;
 char *iodlr_use_ehp = NULL;
 #define HPS (2L * 1024 * 1024)
+#define PS (4L * 1024)
+
+static inline uintptr_t page_align_down(uintptr_t addr) {
+  return (addr & ~(PS - 1));
+}
+
+static inline uintptr_t page_align_up(uintptr_t addr) {
+  return page_align_down(addr + PS - 1);
+}
 
 static inline uintptr_t largepage_align_down(uintptr_t addr) {
   return (addr & ~(HPS - 1));
@@ -63,6 +88,62 @@ static inline uintptr_t largepage_align_down(uintptr_t addr) {
 
 static inline uintptr_t largepage_align_up(uintptr_t addr) {
   return largepage_align_down(addr + HPS - 1);
+}
+
+static map_status FindSection(const char* fname, ElfW(Shdr)** section, char** names, int* nb_segs) {
+  FILE* bin = fopen(fname, "r");
+  if (bin == NULL) return map_open_exe_failed;
+
+#define CLEAN_EXIT(code)                        \
+  do {                                          \
+    int status = 0;                             \
+    if (errno == 0) {                           \
+      status = fclose(bin);                     \
+    }                                           \
+    return ((((code) == map_ok) && status != 0) \
+      ? map_see_errno_close_exe_failed          \
+      : (code));                                \
+  } while (0)
+  // Read the header.
+  ElfW(Ehdr) ehdr;
+  if (fread(&ehdr, sizeof(ehdr), 1, bin) != 1)
+    CLEAN_EXIT(map_read_exe_header_failed);
+
+  // Read the section headers.
+  ElfW(Shdr) shdrs[ehdr.e_shnum];
+  if (fseek(bin, ehdr.e_shoff, SEEK_SET) != 0)
+    CLEAN_EXIT(map_see_errno_seek_exe_sheaders_failed);
+  if (fread(shdrs, sizeof(shdrs[0]), ehdr.e_shnum, bin) != ehdr.e_shnum)
+    CLEAN_EXIT(map_read_exe_sheaders_failed);
+
+  // Read the string table.
+  ElfW(Shdr)* sh_strab = &shdrs[ehdr.e_shstrndx];
+  char section_names[sh_strab->sh_size];
+  if (fseek(bin, sh_strab->sh_offset, SEEK_SET) != 0)
+    CLEAN_EXIT(map_see_errno_seek_exe_string_table_failed);
+  if (fread(section_names, sh_strab->sh_size, 1, bin) != 1)
+    CLEAN_EXIT(map_read_exe_string_table_failed);
+
+  // Find the sections.
+  char to_find[][20] = { ".text\0", ".text.cold\0", ".plt\0", ".plt.got\0", ".trampoline\0", ".init\0", ".fini\0"};
+  for (size_t i = 0; i < sizeof(to_find) / sizeof(to_find[0]); i++) {
+    syslog(LOG_WARNING, "iodlr: searching %s\n", to_find[i]);
+    for (uint32_t idx = 0; idx < ehdr.e_shnum; idx++) {
+      ElfW(Shdr)* sh = &shdrs[idx];
+      if(strlen(&section_names[sh->sh_name]) == 0)
+        continue;
+      if (!memcmp(&section_names[sh->sh_name], to_find[i], strnlen(to_find[i], 20))) {
+        syslog(LOG_WARNING, "iodlr: found %s at %p\n", &section_names[sh->sh_name], sh);
+        section[*nb_segs] = sh;
+        names[*nb_segs] = &section_names[sh->sh_name];
+        *nb_segs +=1;
+        break;
+      };
+    }
+  }
+  CLEAN_EXIT(map_ok);
+
+#undef CLEAN_EXIT
 }
 
 static map_status FindTextSection(const char* fname, ElfW(Shdr)* text_section) {
@@ -111,6 +192,36 @@ static map_status FindTextSection(const char* fname, ElfW(Shdr)* text_section) {
 
   CLEAN_EXIT(map_region_not_found);
 #undef CLEAN_EXIT
+}
+
+static int FindAllMapping(struct dl_phdr_info* hdr, size_t size, void* data) {
+  FindParamsAll* find_params = (FindParamsAll*)data;
+  ElfW(Shdr) *section;
+
+  section = malloc(sizeof(ElfW(Shdr)) * 64);
+  memset(section, 0, sizeof(ElfW(Shdr)) * 64);
+
+  // We are only interested in the information matching the regex or, if no
+  // regex was given, the mapping matching the main executable. This latter
+  // mapping has the empty string for a name.
+  if ((find_params->have_regex &&
+        regexec(&find_params->regex, hdr->dlpi_name, 0, NULL, 0) == 0) ||
+      (hdr->dlpi_name[0] == 0 && !find_params->have_regex)) {
+    const char* fname = (hdr->dlpi_name[0] == 0 ? "/proc/self/exe" : hdr->dlpi_name);
+
+    find_params->status = FindSection(fname, &section, find_params->name, &find_params->nb_segs);
+    // check if there are enough number of hugepages available
+    // i.e. bytes available in HP is more than total_bytes needed
+    // if not set the status = not_enough_pages, otherwise okay
+    if (find_params->status == map_ok && find_params->nb_segs > 0) {
+      for (int i=0; i<find_params->nb_segs; i++) {
+          find_params->start[i] = hdr->dlpi_addr + section[i].sh_addr;
+          find_params->end[i] = find_params->start[i] + section[i].sh_size;
+      }
+    }
+  }
+
+  return 0;
 }
 
 static int FindMapping(struct dl_phdr_info* hdr, size_t size, void* data) {
@@ -186,6 +297,46 @@ static map_status FindTextRegion(const char* lib_regex, mem_range* region) {
   return map_ok;
 }
 
+// Identify and return the text region in the currently mapped memory regions.
+static map_status FindRegion(const char* lib_regex, mem_range* region) {
+  uintptr_t *start = malloc(64 * sizeof(uintptr_t));
+  uintptr_t *stop = malloc(64 * sizeof(uintptr_t));
+  char **names = malloc(64 * sizeof(char*));
+
+  memset(start, 0, sizeof(uintptr_t) * 64);
+  memset(stop, 0, sizeof(uintptr_t) * 64);
+  memset(names, 0, sizeof(char*) * 64);
+  FindParamsAll find_params = { start, stop, names, { 0 }, false, map_region_not_found };
+
+  if (lib_regex != NULL) {
+    if (regcomp(&find_params.regex, lib_regex, 0) != 0) {
+      return map_invalid_regex;
+    }
+    find_params.have_regex = true;
+  }
+
+  // We iterate over all the mappings created for the main executable and any of
+  // its linked-in dependencies. The return value of `FindMapping` will become
+  // the return value of `dl_iterate_phdr`.
+  dl_iterate_phdr(FindAllMapping, &find_params);
+
+  if (find_params.status != map_ok) {
+    regfree(&find_params.regex);
+    return find_params.status;
+  }
+
+  for (int i=0; i < find_params.nb_segs; i++) {
+    region[i].from = (void*)find_params.start[i];
+    region[i].to = (void*)find_params.end[i];
+    strncpy(region[i].name, find_params.name[i], 64);
+  }
+
+  regfree(&find_params.regex);
+  free(start);
+  free(stop);
+  return map_ok;
+}
+
 static map_status IsExplicitHugePagesEnabled(bool* result) {
   *result = false;
   FILE* ifs;
@@ -242,6 +393,35 @@ static map_status IsTransparentHugePagesEnabled(bool* result) {
 #else
   return map_unsupported_platform;
 #endif  // ENABLE_LARGE_CODE_PAGES
+}
+
+static void print_page(void* start_address, void* end_address) {
+#define PAGE_SIZE 0x1000
+
+    char filename[BUFSIZ];
+    int j=0;
+
+    snprintf(filename, sizeof filename, "/proc/%d/pagemap", getpid());
+
+    int fd = open(filename, O_RDONLY);
+    if (fd < 0) {
+        perror("open");
+    }
+    for (uint64_t i = (uint64_t)start_address; i < (uint64_t)end_address; i += 0x1000) {
+        uint64_t data;
+        uint64_t index = (i / PAGE_SIZE) * sizeof(data);
+        if (pread(fd, &data, sizeof(data), index) != sizeof(data)) {
+            perror("pread");
+            break;
+        }
+
+        syslog(LOG_INFO, "iodlr: %-16lx : pfn %-16lx soft-dirty %ld file/shared %ld "
+               "swapped %ld present %ld\n",
+               i, data & 0x7fffffffffffff, (data >> 55) & 1, (data >> 61) & 1, (data >> 62) & 1, (data >> 63) & 1);
+          j++;
+          if (j>4)
+            break;
+    }
 }
 
 // Move specified region to large pages. We need to be very careful.
@@ -344,35 +524,142 @@ MoveRegionToLargePages(const mem_range* r) {
 }
 
 // Align the region to to be mapped to 2MB page boundaries.
-static void AlignRegionToPageBoundary(mem_range* r) {
-  r->from_aligned = (void*)(largepage_align_up((uintptr_t)r->from));
-  r->to_aligned = (void*)(largepage_align_down((uintptr_t)r->to));
+static void AlignRegionToPageBoundary(mem_range* r, size_t pagesize) {
+  if (pagesize == HPS) {
+    r->from_aligned = (void*)(largepage_align_up((uintptr_t)r->from));
+    r->to_aligned = (void*)(largepage_align_down((uintptr_t)r->to));
+  } else {
+    r->from_aligned = (void*)(page_align_up((uintptr_t)r->from));
+    r->to_aligned = (void*)(page_align_down((uintptr_t)r->to));
+  }
 }
 
-static map_status CheckMemRange(mem_range* r) {
+static map_status CheckMemRange(mem_range* r, size_t page_size) {
   if (r->from_aligned == NULL || r->to_aligned == NULL) {
     return map_invalid_region_address;
   }
 
-  if (r->to_aligned - r->from_aligned < HPS || r->from_aligned > r->to_aligned) {
+  if ((r->to_aligned - r->from_aligned) < page_size || r->from_aligned > r->to_aligned) {
     return map_region_too_small;
   }
 
   return map_ok;
 }
 
+
+// XXX: implement multiple device support
+static off_t last_offset = 0x0;
+
+static map_status
+__attribute__((__section__("lpstub")))
+__attribute__((__aligned__(PS)))
+__attribute__((__noinline__))
+MoveRegionToFixedPages(const mem_range* r, const char* device) {
+  void* nmem = NULL;
+  void* tmem = NULL;
+  int ret = 0;
+  map_status status = map_ok;
+  void* start = r->from_aligned;
+  size_t size = r->to_aligned - r->from_aligned;
+
+  // Allocate temporary region preparing for copy
+  nmem = mmap(NULL, size,
+              PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (nmem == MAP_FAILED) {
+    return map_see_errno;
+  }
+
+  memcpy(nmem, start, size);
+#define CLEAN_EXIT_CHECK(oper)                          \
+  if (tmem == MAP_FAILED) {                             \
+    status = oper##_failed;                             \
+    ret = munmap(nmem, size);                           \
+    if (ret < 0) {                                      \
+      status = oper##_munmap_nmem_failed;               \
+    }                                                   \
+    return status;                                      \
+  }
+
+  int fd = open(device, O_RDWR | O_SYNC);
+  if (fd < 0) {
+      perror("Can't open device");
+      return 1;
+  }
+  syslog(LOG_INFO, "iodlr: dump before remapping");
+  print_page(start, start + size);
+
+  tmem = mmap(start, size,
+             PROT_READ | PROT_WRITE | PROT_EXEC,
+             MAP_SHARED | MAP_FIXED, fd, last_offset);
+
+
+  if (tmem == MAP_FAILED) {
+      perror("Oops, mmap failed");
+      return 1;
+  }
+
+  CLEAN_EXIT_CHECK(map_see_errno_mmap_tmem);
+
+#undef CLEAN_EXIT_CHECK
+
+#define CLEAN_EXIT_CHECK(oper)                          \
+  if (ret < 0) {                                        \
+    status = oper##_failed;                             \
+    ret = munmap(tmem, size);                           \
+    if (ret < 0) {                                      \
+      status = oper##_munmap_tmem_failed;               \
+    }                                                   \
+    ret = munmap(nmem, size);                           \
+    if (ret < 0) {                                      \
+      status = (status == oper##_munmap_tmem_failed)    \
+        ? oper##_munmaps_failed                         \
+        : oper##_munmap_nmem_failed;                    \
+    }                                                   \
+    return status;                                      \
+  }
+
+  memcpy(start, nmem, size);
+  mlock(start, size);
+  ret = mprotect(start, size, PROT_READ | PROT_EXEC);
+  CLEAN_EXIT_CHECK(map_see_errno_mprotect);
+
+#undef CLEAN_EXIT_CHECK
+
+  // Release the old/temporary mapped region
+  ret = munmap(nmem, size);
+  if (ret < 0) {
+    status = map_see_errno_munmap_nmem_failed;
+  }
+  syslog(LOG_INFO, "iodlr: dump after remapping");
+  print_page(start, start + size);
+  last_offset += size;
+  close(fd);
+  return status;
+}
+
 // Align the region to to be mapped to 2MB page boundaries and then move the
 // region to large pages.
 static map_status AlignMoveRegionToLargePages(mem_range* r) {
   map_status status;
-  AlignRegionToPageBoundary(r);
+  AlignRegionToPageBoundary(r, HPS);
 
-  status = CheckMemRange(r);
+  status = CheckMemRange(r, HPS);
   if (status != map_ok) {
     return status;
   }
 
   return MoveRegionToLargePages(r);
+}
+
+static map_status AlignMoveRegionToFixedPages(mem_range* r, const char* device) {
+  map_status status;
+  AlignRegionToPageBoundary(r, PS);
+  syslog(LOG_INFO, "iodlr: SEGMENT=%s realigned @ %p -> %p /  %p -> %p \n", r->name, r->from, r->from_aligned, r->to, r->to_aligned);
+  status = CheckMemRange(r, PS);
+  if (status != map_ok) {
+    return status;
+  }
+  return MoveRegionToFixedPages(r, device);
 }
 
 // Map the .text segment of the linked application into 2MB pages.
@@ -413,6 +700,31 @@ map_status MapDSOToLargePages(const char* lib_regex) {
     return status;
   }
   return AlignMoveRegionToLargePages(&r);
+}
+
+map_status MapAllDSOToFixedPages(const char* lib_regex, const char* device) {
+  mem_range *r;
+  map_status status;
+
+  r = malloc(sizeof(mem_range) * 64);
+  memset(r, 0, sizeof(mem_range) * 64);
+
+  if (lib_regex == NULL) {
+    return map_null_regex;
+  }
+
+  status = FindRegion(lib_regex, r);
+
+  if (status != map_ok) {
+    return status;
+  }
+  for (int i=0; r[i].from != 0; i++) {
+    syslog(LOG_INFO, "iodlr: PREPARE TO REMAP SEGMENT=%s @ %p -> %p\n", r[i].name, r[i].from, r[i].to);
+    status = AlignMoveRegionToFixedPages(&r[i], device);
+    if (status != map_ok)
+      syslog(LOG_WARNING, "iodlr: Cannot remap segment %s : %s\n", r[i].name, MapStatusStr(status, true));
+  }
+  return status;
 }
 
 // This function is similar to the function above. However, the region to be

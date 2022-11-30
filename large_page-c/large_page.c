@@ -40,6 +40,9 @@
 typedef struct {
   void*     from;
   void*     to;
+  void*     from_aligned;
+  void*     to_aligned;
+  char      name[64];
 } mem_range;
 
 typedef struct {
@@ -262,8 +265,8 @@ MoveRegionToLargePages(const mem_range* r) {
   void* tmem = NULL;
   int ret = 0;
   map_status status = map_ok;
-  void* start = r->from;
-  size_t size = r->to - r->from;
+  void* start = r->from_aligned;
+  size_t size = r->to_aligned - r->from_aligned;
 
   // Allocate temporary region preparing for copy
   nmem = mmap(NULL, size,
@@ -342,16 +345,16 @@ MoveRegionToLargePages(const mem_range* r) {
 
 // Align the region to to be mapped to 2MB page boundaries.
 static void AlignRegionToPageBoundary(mem_range* r) {
-  r->from = (void*)(largepage_align_up((uintptr_t)r->from));
-  r->to = (void*)(largepage_align_down((uintptr_t)r->to));
+  r->from_aligned = (void*)(largepage_align_up((uintptr_t)r->from));
+  r->to_aligned = (void*)(largepage_align_down((uintptr_t)r->to));
 }
 
 static map_status CheckMemRange(mem_range* r) {
-  if (r->from == NULL || r->to == NULL) {
+  if (r->from_aligned == NULL || r->to_aligned == NULL) {
     return map_invalid_region_address;
   }
 
-  if (r->to - r->from < HPS || r->from > r->to) {
+  if (r->to_aligned - r->from_aligned < HPS || r->from_aligned > r->to_aligned) {
     return map_region_too_small;
   }
 
